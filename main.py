@@ -6,15 +6,19 @@ import socket
 import threading
 import json
 import os
-
+import queue
 
 class PingApp:
-    VERSION:str = "1.0.0"
+    VERSION: str = "1.1.0"
 
     def __init__(self, master):
         self.master = master
         self.master.title(f"IP Scanner Tool - v{self.VERSION}")
         self.master.resizable(False, False)
+
+        # Create a queue for thread communication
+        self.queue = queue.Queue()
+        self.master.after(100, self.process_queue)  # Start processing the queue after 100ms
 
         # Set the window size
         self.window_width = 700
@@ -78,6 +82,7 @@ class PingApp:
         # Set tag colors
         self.tree.tag_configure('success', background='lightgreen')
         self.tree.tag_configure('failure', background='lightcoral')
+        self.tree.tag_configure('grey', background='lightgrey')  # Grey tag for loaded IPs
 
     def load_ip_addresses(self):
         """Load IP addresses and ports from a selected configuration file."""
@@ -87,18 +92,20 @@ class PingApp:
                 with open(file_path, 'r') as file:
                     config = json.load(file)
                     self.ip_addresses = [(key, value.split(':')[0], value.split(':')[1] if ':' in value else None) for key, value in config.items()]
-                    messagebox.showinfo("Success", "IP addresses loaded successfully.")
                     self.check_button.config(state=tk.NORMAL)
                     self.master.title(f"IP Scanner Tool - v{self.VERSION} - {os.path.basename(file_path)}")
+
+                    # Insert the loaded IPs as grey in the treeview
+                    for key, ip, port in self.ip_addresses:
+                        self.tree.insert('', 'end', values=(key, ip, "Loaded", port if port else "Not Checked", "Not Checked", "N/A"), tags=['grey'])
+                    
+                    messagebox.showinfo("Success", "IP addresses loaded successfully.")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load IP addresses: {str(e)}")
 
     def start_checking(self):
         """Start the checking process in a separate thread."""
         self.stop_scanning = False  # Reset the stop flag
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-
         self.check_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
 
@@ -114,6 +121,7 @@ class PingApp:
         """Ping each IP address and optionally check the specified ports."""
         total_count = len(self.ip_addresses)
         timeout = self.timeout_value.get()
+
         for count, (key, ip, port) in enumerate(self.ip_addresses, 1):
             if self.stop_scanning:
                 break
@@ -121,23 +129,47 @@ class PingApp:
             self.status_bar.config(text=f"IP {ip} scanning. {count} of {total_count}")
             self.status_bar.update_idletasks()
 
+            # Find the existing row for the IP address
+            existing_row = None
+            for row in self.tree.get_children():
+                item = self.tree.item(row)
+                if item['values'][1] == ip:  # Check if the IP matches
+                    existing_row = row
+                    break
+
+            # Put "Connecting" state in the queue
+            if existing_row:
+                self.queue.put(("update", existing_row, key, ip, "Connecting", port if port else "Not Checked", "Not Checked", "N/A"))
+
+            # Perform the actual ping
             ping_result, ping_time = self.ping(ip, timeout)
 
+            # Now check the port if a port is specified
             if port:
                 port_result = self.check_port(ip, port, timeout)
                 connection_state = "Connected" if ping_result == "Response received" else "Not Connected"
                 if port_result == "Open" and connection_state == "Not Connected":
                     connection_state = "Connected (Port Open)"
                 port_state = "Open" if port_result == "Open" else "Closed"
-                self.insert_row(key, ip, connection_state, port, port_state, ping_time)
+                # Put final state in the queue
+                self.queue.put(("update", existing_row, key, ip, connection_state, port, port_state, ping_time))
             else:
                 connection_state = "Connected" if ping_result == "Response received" else "Not Connected"
-                self.insert_row(key, ip, connection_state, "Not Checked", "Not Checked", ping_time)
+                # Put final state in the queue
+                self.queue.put(("update", existing_row, key, ip, connection_state, "Not Checked", "Not Checked", ping_time))
 
         if not self.stop_scanning:
             self.status_bar.config(text="Scanning complete.")
-        self.check_button.config(state=tk.NORMAL)
-        self.stop_button.config(state=tk.DISABLED)
+        
+        # Use after() to safely update the button in the main thread, only if the window is still open
+        if self.master.winfo_exists():  # Check if the window is still alive
+            self.master.after(0, self.check_button.config, {"state": tk.NORMAL})
+            self.master.after(0, self.stop_button.config, {"state": tk.DISABLED})
+
+    def update_row(self, row_id, key, ip, connection_state, port, port_state, time):
+        """Update an existing row in the treeview."""
+        tags = ['failure'] if connection_state == "Not Connected" or port_state == "Closed" else ['success']
+        self.tree.item(row_id, values=(key, ip, connection_state, port, port_state, time), tags=tags)
 
     def insert_row(self, key, ip, connection_state, port, port_state, time):
         """Insert a row into the table and color-code based on status."""
@@ -166,7 +198,20 @@ class PingApp:
                 return "Open"
         except (socket.timeout, socket.error):
             return "Closed"
-
+        
+    def process_queue(self):
+        """Process the queue and update the treeview with the results."""
+        try:
+            while True:
+                message = self.queue.get_nowait()  # Non-blocking, get the message
+                if message[0] == "update":
+                    # Update the row in the treeview with the data from the queue
+                    self.update_row(*message[1:])
+                self.queue.task_done()  # Mark the task as done
+        except queue.Empty:
+            pass
+        # Call this method again after 100ms to continue processing
+        self.master.after(100, self.process_queue)
 
 if __name__ == "__main__":
     root = tk.Tk()
